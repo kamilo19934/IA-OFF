@@ -1,5 +1,4 @@
-from flask import Flask, redirect, request, session, url_for, render_template, jsonify
-from flask_session import Session
+from flask import redirect, request, session, url_for, render_template, jsonify
 import requests
 import os
 from dotenv import load_dotenv
@@ -7,60 +6,32 @@ import sys
 from urllib.parse import urlencode
 import json
 import secrets
-from datetime import datetime
+from datetime import datetime, timezone
 import whisper
 import tempfile
 from pydub import AudioSegment
 import io
 import httpx
 import ssl
+from flask_apscheduler import APScheduler
+from app.database import save_token, get_valid_token, refresh_token, Token
+from sqlalchemy.orm import Session as SQLAlchemySession
 
-def init_env():
-    """Initialize and verify environment variables"""
-    # Load environment variables
-    load_dotenv(override=True)
-    
-    # Required environment variables
-    required_vars = ['GHL_CLIENT_ID', 'GHL_CLIENT_SECRET', 'FLASK_SECRET_KEY', 'OPENAI_API_KEY']
-    
-    # Check if all required variables are set
-    missing_vars = [var for var in required_vars if not os.getenv(var)]
-    
-    if missing_vars:
-        print("Error: Missing required environment variables:")
-        for var in missing_vars:
-            print(f"- {var}")
-        print("\nPlease check your .env file and ensure all required variables are set.")
-        sys.exit(1)
-    
-    # Print loaded variables (without sensitive data)
-    print("\nEnvironment variables loaded successfully:")
-    print(f"GHL_CLIENT_ID: {os.getenv('GHL_CLIENT_ID')}")
-    print(f"GHL_REDIRECT_URI: {os.getenv('GHL_REDIRECT_URI', 'http://localhost:5000/callback')}")
-    print(f"FLASK_SECRET_KEY: {'*' * 20}")  # Don't print the actual secret key
-    print(f"OPENAI_API_KEY: {'*' * 20}")  # Don't print the actual API key
+# GoHighLevel API configuration
+API_BASE_URL = 'https://services.leadconnectorhq.com'
+API_VERSION = '2021-07-28'
+GHL_AUTH_URL = 'https://marketplace.gohighlevel.com/oauth/chooselocation'
+GHL_TOKEN_URL = 'https://services.leadconnectorhq.com/oauth/token'
 
-# Initialize environment variables
-init_env()
+# Load environment variables
+load_dotenv()
 
-app = Flask(__name__)
-app.config['SECRET_KEY'] = os.getenv('FLASK_SECRET_KEY')
-app.config['SESSION_TYPE'] = 'filesystem'
-Session(app)
-
-# GoHighLevel OAuth Configuration
+# Get environment variables
 GHL_CLIENT_ID = os.getenv('GHL_CLIENT_ID')
 GHL_CLIENT_SECRET = os.getenv('GHL_CLIENT_SECRET')
-GHL_REDIRECT_URI = os.getenv('GHL_REDIRECT_URI', 'http://localhost:5000/callback')
-GHL_AUTH_URL = 'https://marketplace.gohighlevel.com/oauth/chooselocation'
-GHL_TOKEN_URL = 'https://services.leadconnectorhq.com/oauth/token'  # Updated to use the correct endpoint
+GHL_REDIRECT_URI = os.getenv('GHL_REDIRECT_URI')
 
-# Debug print
-print(f"Client ID: {GHL_CLIENT_ID}")
-print(f"Client Secret: {GHL_CLIENT_SECRET}")
-print(f"Redirect URI: {GHL_REDIRECT_URI}")
-
-# Scopes for the application
+# Define required scopes
 SCOPES = [
     'conversations.write',
     'conversations/message.readonly',
@@ -71,8 +42,51 @@ SCOPES = [
     'locations/customValues.write',
     'locations/tags.write',
     'locations/tags.readonly',
-    'locations/customValues.readonly'
+    'locations/customValues.readonly',
+    'locations/customFields.readonly',
+    'locations/customFields.write'
 ]
+
+# Initialize Whisper model
+model = whisper.load_model("base")
+
+# Configuración del Scheduler
+scheduler = APScheduler()
+scheduler.init_app(app)
+
+def check_token():
+    """Función para verificar y refrescar el token si es necesario"""
+    with app.app_context():
+        try:
+            print("\n=== TOKEN CHECK STARTED ===")
+            print(f"Time: {datetime.now(timezone.utc).isoformat()}")
+            
+            token = get_valid_token()
+            if token:
+                print("✅ Token check: Token is valid")
+                print(f"Token: {token[:20]}...")
+            else:
+                print("⚠️ Token check: Token needs refresh")
+                print("Attempting to refresh token...")
+                # Intentar refrescar el token
+                new_token = refresh_token()
+                if new_token:
+                    print("✅ Token refreshed successfully")
+                else:
+                    print("❌ Failed to refresh token")
+        except Exception as e:
+            print(f"❌ Token check error: {str(e)}")
+            import traceback
+            print(f"Traceback: {traceback.format_exc()}")
+        print("=== TOKEN CHECK COMPLETED ===\n")
+
+# Configurar el job para que se ejecute cada 5 minutos durante las pruebas
+scheduler.add_job(id='check_token', func=check_token, trigger='interval', minutes=5)
+scheduler.start()
+
+print("\n=== SCHEDULER STARTED ===")
+print("Token check will run every 5 minutes")
+print("Press Ctrl+C to stop the application")
 
 class MessageHandler:
     @staticmethod
@@ -223,7 +237,63 @@ class MessageHandler:
             return None
 
     @staticmethod
-    def process_attachments(attachments):
+    def send_inbound_message(conversation_id, message, message_type, attachments=None):
+        """Send an inbound message with transcription to GoHighLevel"""
+        try:
+            url = f"{API_BASE_URL}/conversations/messages/inbound"
+            
+            # Obtener un token válido
+            access_token = get_valid_token()
+            if not access_token:
+                print("Error: No valid token available")
+                return None
+                
+            headers = {
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json",
+                "Version": API_VERSION
+            }
+            
+            payload = {
+                "type": message_type,
+                "message": message,
+                "conversationId": conversation_id,
+                "direction": "inbound",
+                "date": datetime.now(timezone.utc).isoformat()
+            }
+            
+            if attachments:
+                payload["attachments"] = attachments
+            
+            print("\n=== SENDING INBOUND MESSAGE ===")
+            print(f"URL: {url}")
+            print(f"Headers: {json.dumps({k: v for k, v in headers.items() if k != 'Authorization'}, indent=2)}")
+            print(f"Payload: {json.dumps(payload, indent=2)}")
+            
+            try:
+                response = requests.post(url, headers=headers, json=payload)
+                print(f"\nResponse status: {response.status_code}")
+                print(f"Response headers: {dict(response.headers)}")
+                print(f"Response body: {response.text}")
+                
+                if response.status_code != 200:
+                    print(f"Error response: {response.text}")
+                    return None
+                
+                return response.json()
+                
+            except requests.exceptions.RequestException as e:
+                print(f"Request error: {str(e)}")
+                return None
+            
+        except Exception as e:
+            print(f"Error sending inbound message: {str(e)}")
+            import traceback
+            print(f"Traceback: {traceback.format_exc()}")
+            return None
+
+    @staticmethod
+    def process_attachments(attachments, conversation_id, message_type):
         """Process attachments and transcribe audio files"""
         transcriptions = []
         
@@ -245,6 +315,10 @@ class MessageHandler:
                     'url': attachment_url,
                     'transcription': transcription
                 })
+                
+                # Send transcription as inbound message
+                message = f"🎯 Transcripción del audio:\n\n{transcription}"
+                MessageHandler.send_inbound_message(conversation_id, message, message_type)
             else:
                 print("Failed to transcribe audio")
         
@@ -268,7 +342,7 @@ class MessageHandler:
         attachments = data.get('attachments', [])
         if attachments:
             print("\nProcessing attachments...")
-            transcriptions = MessageHandler.process_attachments(attachments)
+            transcriptions = MessageHandler.process_attachments(attachments, data.get('conversationId'), data.get('type'))
             if transcriptions:
                 print("\nTranscriptions:")
                 for trans in transcriptions:
@@ -291,149 +365,214 @@ class MessageHandler:
 
 @app.route('/')
 def index():
-    if 'access_token' not in session:
-        return render_template('login.html')
-    return render_template('dashboard.html')
-
-@app.route('/login')
-def login():
-    if not GHL_CLIENT_ID:
-        return "Error: GHL_CLIENT_ID no está configurado", 500
-    
-    # Generate state parameter for security
-    state = secrets.token_urlsafe(16)
-    session['oauth_state'] = state
-    
-    # Prepare the authorization parameters
-    params = {
-        'client_id': GHL_CLIENT_ID,
-        'redirect_uri': GHL_REDIRECT_URI,
-        'response_type': 'code',
-        'scope': ' '.join(SCOPES),
-        'state': state  # Add state parameter
-    }
-    
-    # Construct the authorization URL with proper encoding
-    auth_url = f"{GHL_AUTH_URL}?{urlencode(params)}"
-    
-    # Debug prints
-    print("\nAuthorization URL details:")
-    print(f"Base URL: {GHL_AUTH_URL}")
-    print(f"Parameters: {params}")
-    print(f"Final URL: {auth_url}")
-    
-    return redirect(auth_url)
-
-@app.route('/callback')
-def callback():
-    # Verify state parameter
-    state = request.args.get('state')
-    if not state or state != session.get('oauth_state'):
-        return 'Error: Invalid state parameter', 400
-
-    code = request.args.get('code')
-    if not code:
-        print("Error: No code received in callback")
-        return 'Error: No code received', 400
-
-    print(f"\nReceived code: {code}")
-
-    # Exchange code for access token
-    token_data = {
-        'client_id': GHL_CLIENT_ID,
-        'client_secret': GHL_CLIENT_SECRET,
-        'code': code,
-        'grant_type': 'authorization_code',
-        'redirect_uri': GHL_REDIRECT_URI,
-        'user_type': 'Location'  # Added user_type parameter as required by the API
-    }
-
-    print("\nToken request details:")
-    print(f"Token URL: {GHL_TOKEN_URL}")
-    print(f"Request data: {json.dumps({k: v for k, v in token_data.items() if k != 'client_secret'}, indent=2)}")
-
-    try:
-        # Add headers to specify we want JSON response
-        headers = {
-            'Content-Type': 'application/x-www-form-urlencoded',
-            'Accept': 'application/json'
-        }
-        
-        response = requests.post(GHL_TOKEN_URL, data=token_data, headers=headers)
-        print(f"\nResponse status code: {response.status_code}")
-        print(f"Response headers: {dict(response.headers)}")
-        print(f"Raw response: {response.text}")
-        print(f"Response content type: {response.headers.get('content-type', 'Not specified')}")
-
-        if response.status_code != 200:
-            print(f"Error response: {response.text}")
-            return f'Error: {response.text}', 400
-
-        # Try to decode the response as JSON
-        try:
-            token_info = response.json()
-            print(f"Decoded JSON response: {json.dumps(token_info, indent=2)}")
-        except json.JSONDecodeError as e:
-            print(f"Error decoding JSON response: {e}")
-            print(f"Raw response content: {response.text}")
-            print(f"Response content type: {response.headers.get('content-type', 'Not specified')}")
-            return f'Error: Invalid JSON response from server. Response: {response.text}', 500
-
-        if 'access_token' not in token_info:
-            print(f"Error: No access token in response. Response: {token_info}")
-            return f'Error: No access token in response. Response: {json.dumps(token_info)}', 500
-
-        session['access_token'] = token_info['access_token']
-        session['refresh_token'] = token_info.get('refresh_token')
-        session['expires_in'] = token_info.get('expires_in')
-        session['location_id'] = token_info.get('locationId')  # Store location ID if available
-        session['company_id'] = token_info.get('companyId')  # Store company ID if available
-
-        print("\nToken exchange successful!")
-        return redirect(url_for('index'))
-
-    except requests.exceptions.RequestException as e:
-        print(f"\nRequest error: {str(e)}")
-        return f'Error during request: {str(e)}', 500
-    except Exception as e:
-        print(f"\nUnexpected error: {str(e)}")
-        return f'Unexpected error: {str(e)}', 500
+    """Render the index page"""
+    locations = get_locations() if session.get('access_token') else []
+    return render_template('index.html', locations=locations)
 
 @app.route('/logout')
 def logout():
+    """Clear the session and redirect to index"""
     session.clear()
     return redirect(url_for('index'))
+
+def get_locations():
+    """Get list of locations from GoHighLevel"""
+    try:
+        access_token = get_valid_token()
+        if not access_token:
+            return []
+            
+        # Get location ID from the token in database
+        db = SQLAlchemySession()
+        try:
+            token = db.query(Token).order_by(Token.created_at.desc()).first()
+            if not token or not token.location_id:
+                print("No location ID found in token")
+                return []
+                
+            location_id = token.location_id
+            print(f"\nUsing location ID: {location_id}")
+            
+            url = f"{API_BASE_URL}/locations/{location_id}"
+            headers = {
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json",
+                "Version": API_VERSION
+            }
+            
+            print(f"\nFetching location details from: {url}")
+            response = requests.get(url, headers=headers)
+            print(f"Response status: {response.status_code}")
+            print(f"Response body: {response.text}")
+            
+            if response.status_code == 200:
+                location = response.json()
+                return [location]  # Return as a list to maintain compatibility
+            else:
+                print(f"Error getting location: {response.status_code} - {response.text}")
+                return []
+        finally:
+            db.close()
+            
+    except Exception as e:
+        print(f"Error in get_locations: {str(e)}")
+        import traceback
+        print(f"Traceback: {traceback.format_exc()}")
+        return []
+
+@app.route('/login')
+def login():
+    """Redirect to GoHighLevel OAuth page"""
+    try:
+        # Generate state for CSRF protection
+        state = secrets.token_urlsafe(16)
+        session['oauth_state'] = state
+        
+        # Build the authorization URL
+        params = {
+            'client_id': os.getenv('GHL_CLIENT_ID'),
+            'redirect_uri': os.getenv('GHL_REDIRECT_URI'),
+            'response_type': 'code',
+            'scope': ' '.join(SCOPES)  # Use all scopes
+        }
+        
+        # Add state parameter
+        params['state'] = state
+        
+        # Construct the full URL with parameters
+        auth_url = f"{GHL_AUTH_URL}?{urlencode(params)}"
+        print(f"\nAuthorization URL: {auth_url}")
+        
+        return redirect(auth_url)
+    except Exception as e:
+        print(f"Error in login route: {str(e)}")
+        return f"Error: {str(e)}", 500
+
+@app.route('/callback')
+def callback():
+    """Handle OAuth callback from GoHighLevel"""
+    try:
+        # Get authorization code from query parameters
+        code = request.args.get('code')
+        state = request.args.get('state')
+        
+        # Verify state to prevent CSRF attacks
+        if state != session.get('oauth_state'):
+            return "Invalid state parameter", 400
+            
+        # Exchange code for access token
+        token_url = GHL_TOKEN_URL
+        token_data = {
+            "client_id": os.getenv('GHL_CLIENT_ID'),
+            "client_secret": os.getenv('GHL_CLIENT_SECRET'),
+            "code": code,
+            "grant_type": "authorization_code",
+            "redirect_uri": os.getenv('GHL_REDIRECT_URI')
+        }
+        
+        print("\n=== TOKEN REQUEST ===")
+        print(f"Token URL: {token_url}")
+        print(f"Request data: {json.dumps({k: v for k, v in token_data.items() if k != 'client_secret'}, indent=2)}")
+        
+        response = requests.post(token_url, data=token_data)
+        print(f"\nResponse status: {response.status_code}")
+        print(f"Response body: {response.text}")
+        
+        response.raise_for_status()
+        token_info = response.json()
+        
+        # Save token without location_id (it will be updated when we receive the webhook)
+        token = save_token(token_info)
+        if not token:
+            print("Failed to save token")
+            return "Failed to save token", 500
+            
+        # Store tokens in session
+        session['access_token'] = token_info['access_token']
+        session['refresh_token'] = token_info.get('refresh_token')
+        
+        print("\n=== TOKEN SAVED ===")
+        print(f"Access Token: {token_info['access_token'][:20]}...")
+        print(f"Refresh Token: {token_info.get('refresh_token', '')[:20]}...")
+        
+        return redirect(url_for('index'))
+        
+    except Exception as e:
+        print(f"Error in callback: {str(e)}")
+        import traceback
+        print(f"Traceback: {traceback.format_exc()}")
+        return f"Error: {str(e)}", 500
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
     """Handle incoming webhooks from GoHighLevel"""
     try:
-        # Get the webhook data
         data = request.get_json()
+        print("\n=== WEBHOOK DATA ===")
+        print(json.dumps(data, indent=2))
         
-        if not data:
-            print("Error: No data received in webhook")
-            return jsonify({'error': 'No data received'}), 400
+        # Handle installation webhook
+        if data.get('type') == 'INSTALL':
+            location_id = data.get('locationId')
+            if location_id:
+                print(f"\nReceived installation webhook for location: {location_id}")
+                
+                # Update the token with the location ID
+                db = SQLAlchemySession()
+                try:
+                    # Get the most recent token
+                    token = db.query(Token).order_by(Token.created_at.desc()).first()
+                    if token:
+                        token.location_id = location_id
+                        db.commit()
+                        print(f"Updated token with location ID: {location_id}")
+                    else:
+                        print("No token found to update with location ID")
+                except Exception as e:
+                    print(f"Error updating token: {str(e)}")
+                    db.rollback()
+                finally:
+                    db.close()
+                
+                return jsonify({'success': True})
         
-        # Get the message type
-        message_type = data.get('type')
+        # Get the message type from the webhook data
+        message_type = data.get('messageType')
+        print(f"\nMessage Type: {message_type}")
         
-        # Handle different message types
-        if message_type == 'OutboundMessage':
-            success = MessageHandler.handle_outbound_message(data)
-        elif message_type == 'InboundMessage':
-            success = MessageHandler.handle_inbound_message(data)
-        else:
-            print(f"Unknown message type: {message_type}")
-            return jsonify({'error': 'Unknown message type'}), 400
+        if not message_type:
+            print("Error: No messageType in webhook data")
+            return jsonify({'error': 'No messageType provided'}), 400
         
-        if success:
-            return jsonify({'status': 'success'}), 200
-        else:
-            return jsonify({'error': 'Failed to process message'}), 500
-            
+        # Get conversation ID
+        conversation_id = data.get('conversationId')
+        print(f"Conversation ID: {conversation_id}")
+        
+        if not conversation_id:
+            print("Error: No conversationId in webhook data")
+            return jsonify({'error': 'No conversationId provided'}), 400
+        
+        # Process attachments if present
+        if 'attachments' in data:
+            print(f"\nFound {len(data['attachments'])} attachments")
+            transcriptions = MessageHandler.process_attachments(
+                data['attachments'], 
+                conversation_id,
+                message_type
+            )
+            if transcriptions:
+                print("\nTranscriptions:")
+                for t in transcriptions:
+                    print(f"URL: {t['url']}")
+                    print(f"Transcription: {t['transcription']}")
+                    print("---")
+        
+        return jsonify({'success': True})
     except Exception as e:
         print(f"Error processing webhook: {str(e)}")
+        print(f"Exception type: {type(e)}")
+        import traceback
+        print(f"Traceback: {traceback.format_exc()}")
         return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
